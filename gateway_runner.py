@@ -152,7 +152,7 @@ def _tag_matches(scanned: str, stored) -> bool:
         return False
     if " " in stored:
         return match_6ctoc(stored, scanned)
-    return scanned == stored or scanned == stored[:TAG_LEN - 1]
+    return scanned == stored or scanned[:TAG_LEN - 1] == stored[:TAG_LEN - 1]
 
 
 def lookup_tag(tag: str, street_name: str) -> Tuple[bool, Optional[str]]:

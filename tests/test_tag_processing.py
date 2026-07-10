@@ -48,11 +48,28 @@ class TagProcessingTests(unittest.TestCase):
                 self.assertEqual(classified.lookup_value, value)
                 self.assertEqual(classified.protocol, "legacy")
 
-    def test_dotted_tag_supports_full_ten_character_serial(self):
-        value = "DFW.1234567890"
+    def test_live_legacy_reader_suffixes_are_removed(self):
+        observed = {
+            "DFW.0683855844": "DFW.06838558",
+            "DFW.039806621F": "DFW.03980662",
+            "DFW.0695606620": "DFW.06956066",
+            "DNT.1268287922": "DNT.12682879",
+            "DNT.15295695E0": "DNT.15295695",
+        }
+        for raw_value, stored_value in observed.items():
+            with self.subTest(raw_value=raw_value):
+                classified = classify_tag_output(raw_value)
+                self.assertIsNotNone(classified)
+                self.assertEqual(classified.lookup_value, stored_value)
+                self.assertEqual(classified.display_value, stored_value)
+                self.assertEqual(classified.protocol, "legacy")
+
+    def test_agency_prefixed_legacy_identifier_is_preserved(self):
+        value = "OOCEA0779782"
         classified = classify_tag_output(value)
         self.assertIsNotNone(classified)
         self.assertEqual(classified.lookup_value, value)
+        self.assertEqual(classified.protocol, "legacy")
 
     def test_long_non_6c_output_is_discarded(self):
         for value in ("12345678901", "280083348888", "3400301854AA"):
