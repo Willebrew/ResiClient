@@ -1,166 +1,169 @@
 #!/usr/bin/env python3
 """
-gateway_runnerwlogging.py
+gateway_runner.py — ResiLIVE Gateway Access Control
 
-This script acts as an access control gateway to ResiLIVE, interfacing with Firestore and a local SQLite database
-to manage community access via RFID tags. It listens to a serial port for RFID reads, verifies tags
-against the community's allowed users, triggers relays, and logs access events to ResiLIVE.
+Interfaces with Firestore and a local SQLite database to manage community
+access via RFID tags. Reads tags from a serial port, validates against
+the community's allowed users, triggers relays, and logs access events.
 
 Key features:
 - Syncs Firestore community documents to local SQLite for fast access validation
 - Listens for RFID tag reads over serial connection and validates them
 - Logs access attempts (granted/denied) to ResiLIVE
-- Supports remote gate-opening commands via polling an HTTP endpoint
+- Supports remote gate-opening commands via Firestore commands collection
 - Handles real-time Firestore updates via snapshot listeners
 - Automatically reconnects to Firestore after network outages
-
-The system operates in two main modes:
-1. Local RFID tag validation - reading tags from a serial port reader
-2. Remote command polling - allowing authorized remote gate opening
-
-This gateway is designed for resilient operation with local caching to ensure
-functionality even during temporary network outages.
+- Offline log queue ensures no access events are lost during outages
+- Tag debounce prevents duplicate reads from flooding the system
 """
-# Standard library imports for data handling, database, timing and concurrency
-import json, sqlite3, time, threading
-from pathlib import Path
-from typing import List, Optional
 
-# Firebase Admin SDK for Firestore database access
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import time
+import threading
+from pathlib import Path
+from typing import List, Optional, Tuple
+
 import firebase_admin
 from firebase_admin import credentials, firestore
-# PySerial for RFID reader communication
+from google.cloud.firestore_v1.base_query import FieldFilter
 import serial
-# Requests for HTTP communication with logging service and remote controller
 import requests
 
 from relay_controller import open_door
-
-# Import configuration values from config.py
+from tag_6c import decode_6ctoc, is_6ctoc_tag, match_6ctoc
 from config import (
-    COMMUNITY_NAME,        # Name of the community this gateway serves
-    COMMUNITY_STREET_NAME, # Street address of the community location
-    COMMUNITY_STREET_NAME_HARVEY, # Street address of the community location
-    LOG_URL,              # URL endpoint for access logging
-    API_KEY,              # API key for authentication with remote services
-    ENABLE_REMOTE_CONTROL, # Flag to enable/disable remote control via Vercel endpoint
+    COMMUNITY_NAME,
+    COMMUNITY_STREET_NAME,
+    COMMUNITY_STREET_NAME_HARVEY,
+    LOG_URL,
+    API_KEY,
+    ENABLE_REMOTE_CONTROL,
 )
 
-# Path to Firebase service account credentials file
+# ── Paths ────────────────────────────────────────────────────────────────────
 SERVICE_ACCOUNT_PATH = "serviceAccountKey.json"
-# Path to SQLite database file (stored in same directory as this script)
 SQLITE_PATH          = Path(__file__).with_name("communities.db")
 
-# Serial port configuration for RFID reader
-SERIAL_PORT    = "/dev/ttyUSB0"  # USB port where RFID reader is connected
-BAUDRATE       = 9600           # Communication speed with the reader
-SERIAL_TIMEOUT = 0.1           # Timeout in seconds for serial read operations
+# ── Serial config ────────────────────────────────────────────────────────────
+SERIAL_PORT    = "/dev/ttyUSB0"
+BAUDRATE       = 9600
+SERIAL_TIMEOUT = 0.1
 
-# Length of RFID tag strings to process
-TAG_LEN = 13
+# ── Tag validation ───────────────────────────────────────────────────────────
+TAG_LEN     = 13
+TAG_PATTERN = re.compile(r"^[A-Z0-9.]+$")  # Valid tag chars: alphanumeric + dots
+TAG_MIN_LEN = 8                              # Minimum length for a real tag
 
-# Firestore watchdog configuration
-WATCHDOG_INTERVAL = 60        # Check connection every 60 seconds
-WATCHDOG_TIMEOUT = 300        # Consider connection dead if no update in 5 minutes
-RECONNECT_BACKOFF_MAX = 60    # Maximum backoff time between reconnection attempts
+# ── Debounce / passback ─────────────────────────────────────────────────────
+PASSBACK_TIMEOUT      = 10   # Seconds before the same tag can trigger again
+PASSBACK_CLEANUP_INTERVAL = 60  # Seconds between old-entry cleanup passes
 
-# Initialize Firebase Admin SDK with service account credentials
+# ── Firestore watchdog ───────────────────────────────────────────────────────
+WATCHDOG_INTERVAL     = 60    # Check connection every 60 seconds
+WATCHDOG_TIMEOUT      = 900   # Consider stale if no snapshot in 15 minutes
+RECONNECT_BACKOFF_MAX = 60    # Max backoff between reconnection attempts
+WATCHDOG_MAX_FAILURES = 10    # Force process restart after this many consecutive failures
+
+# ── Offline log queue ────────────────────────────────────────────────────────
+LOG_FLUSH_INTERVAL = 30   # Seconds between flush attempts
+LOG_FLUSH_BATCH    = 20   # Max pending logs to send per flush
+LOG_MAX_ATTEMPTS   = 100  # Discard after this many failed attempts
+
+# ── Heartbeat / diagnostics ──────────────────────────────────────────────────
+HEARTBEAT_INTERVAL = 30   # Seconds between heartbeat POSTs
+_start_time = time.time()
+
+# Shared state for last tag read (updated by read_loop, read by heartbeat)
+_last_tag_info = {"tag": None, "time": None, "status": None}
+_last_tag_lock = threading.Lock()
+
+# Serial port connection state
+_serial_connected = False
+
+# ── Firebase init ────────────────────────────────────────────────────────────
 cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
 firebase_admin.initialize_app(cred)
-# Get Firestore client and reference to collections
 db = firestore.client()
 communities_ref = db.collection("communities")
-commands_ref = db.collection("commands")  # For remote commands from UI
+commands_ref    = db.collection("commands")
 
-# Initialize SQLite connection for writing community data
-# check_same_thread=False allows access from multiple threads
-# isolation_level=None enables autocommit mode
+# ── SQLite init ──────────────────────────────────────────────────────────────
 writer_conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False, isolation_level=None)
-# Enable Write-Ahead Logging for better concurrency and crash recovery
 writer_conn.execute("PRAGMA journal_mode=WAL")
 writer_cur = writer_conn.cursor()
-# Create communities table if it doesn't exist
-writer_cur.execute(
-    """
+
+writer_cur.execute("""
     CREATE TABLE IF NOT EXISTS communities (
-        id   TEXT PRIMARY KEY,  -- Firestore document ID
-        data TEXT NOT NULL     -- JSON serialized document data
+        id   TEXT PRIMARY KEY,
+        data TEXT NOT NULL
     )
-"""
-)
-writer_conn.commit()  # Ensure table creation is committed
+""")
+writer_cur.execute("""
+    CREATE TABLE IF NOT EXISTS pending_logs (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        payload    TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        attempts   INTEGER DEFAULT 0
+    )
+""")
+writer_conn.commit()
 
-# Firestore connection state tracking
-_last_snapshot_time = time.time()  # Track when we last received a snapshot
-_snapshot_lock = threading.Lock()   # Thread-safe access to snapshot state
-_current_watch = None               # Current Firestore listener reference
-_watch_lock = threading.Lock()      # Thread-safe access to watch reference
+# ── Firestore connection state ───────────────────────────────────────────────
+_last_snapshot_time = time.time()
+_snapshot_lock      = threading.Lock()
+_current_watch      = None
+_watch_lock         = threading.Lock()
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Snapshot time helpers
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _update_snapshot_time() -> None:
-    """Update the last snapshot time to indicate the connection is alive."""
     global _last_snapshot_time
     with _snapshot_lock:
         _last_snapshot_time = time.time()
 
 
 def _get_snapshot_age() -> float:
-    """Get seconds since last snapshot update."""
     with _snapshot_lock:
         return time.time() - _last_snapshot_time
 
 
-def get_tag_owner(tag: str) -> Optional[str]:
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tag lookup (unified — replaces duplicated functions)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _tag_matches(scanned: str, stored) -> bool:
     """
-    Return the *username* associated with `tag`, or None if unknown.
+    Compare a scanned tag to a stored playerId/id value.
 
-    The lookup mirrors the search paths used by `is_tag_valid` so we don't disturb
-    any existing validation logic.
+    - 6C printed form ("NTTA 0000480314") in storage → match via match_6ctoc()
+      against the scanned EPC hex.
+    - ATA tags (no space) → legacy 12-char truncation match.
     """
-    tag = tag.strip().upper()
+    stored = str(stored or "").strip().upper()
+    if not stored:
+        return False
+    if " " in stored:
+        return match_6ctoc(stored, scanned)
+    return scanned == stored[:TAG_LEN - 1]
 
-    try:
-        with sqlite3.connect(SQLITE_PATH, isolation_level=None) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            for (data_blob,) in conn.execute("SELECT data FROM communities"):
-                try:
-                    doc = json.loads(data_blob)
-                except json.JSONDecodeError:
-                    continue
-                if COMMUNITY_NAME and doc.get("name") != COMMUNITY_NAME:
-                    continue
 
-                # 1) top-level allowedUsers (could be strings or dicts)
-                for u in doc.get("allowedUsers", []):
-                    if isinstance(u, dict):
-                        if tag == str(u.get("id", "")).upper()[: TAG_LEN - 1] \
-                        or tag == str(u.get("playerId", "")).upper()[: TAG_LEN - 1]:
-                            return u.get("username")
-                    else:  # string entry, no username stored
-                        if tag == str(u).upper()[: TAG_LEN - 1]:
-                            return None
-
-                # 2) nested addresses -> people
-                for addr in doc.get("addresses", []):
-                    if addr.get("street") != COMMUNITY_STREET_NAME:
-                        continue
-                    for p in addr.get("people", []):
-                        if tag in {
-                            str(p.get("id", "")).upper()[: TAG_LEN - 1],
-                            str(p.get("playerId", "")).upper()[: TAG_LEN - 1],
-                        }:
-                            return p.get("username")
-    except sqlite3.Error as e:
-        print(f"[DB-ERROR] {e}")
-
-    return None
-
-def get_tag_owner_harvey(tag: str) -> Optional[str]:
+def lookup_tag(tag: str, street_name: str) -> Tuple[bool, Optional[str]]:
     """
-    Return the *username* associated with `tag`, or None if unknown.
+    Validate a tag and return its owner in a single DB pass.
 
-    The lookup mirrors the search paths used by `is_tag_valid` so we don't disturb
-    any existing validation logic.
+    `tag` may be either an ATA short ID (12 chars, e.g. "DFW.06956066")
+    or a 6C EPC hex string (24 or 28 chars, e.g. "31B03E000000030450...").
+
+    Returns:
+        (is_valid, owner_name)  — owner_name is None if the tag is a plain
+        string entry or if lookup fails.
     """
     tag = tag.strip().upper()
 
@@ -175,41 +178,34 @@ def get_tag_owner_harvey(tag: str) -> Optional[str]:
                 if COMMUNITY_NAME and doc.get("name") != COMMUNITY_NAME:
                     continue
 
-                # 1) top-level allowedUsers (could be strings or dicts)
+                # 1) Top-level allowedUsers
                 for u in doc.get("allowedUsers", []):
                     if isinstance(u, dict):
-                        if tag == str(u.get("id", "")).upper()[: TAG_LEN - 1] \
-                        or tag == str(u.get("playerId", "")).upper()[: TAG_LEN - 1]:
-                            return u.get("username")
-                    else:  # string entry, no username stored
-                        if tag == str(u).upper()[: TAG_LEN - 1]:
-                            return None
+                        if _tag_matches(tag, u.get("id")) or _tag_matches(tag, u.get("playerId")):
+                            return True, u.get("username")
+                    else:
+                        if _tag_matches(tag, u):
+                            return True, None
 
-                # 2) nested addresses -> people
+                # 2) Nested addresses -> people
                 for addr in doc.get("addresses", []):
-                    if addr.get("street") != COMMUNITY_STREET_NAME_HARVEY:
+                    if addr.get("street") != street_name:
                         continue
                     for p in addr.get("people", []):
-                        if tag in {
-                            str(p.get("id", "")).upper()[: TAG_LEN - 1],
-                            str(p.get("playerId", "")).upper()[: TAG_LEN - 1],
-                        }:
-                            return p.get("username")
+                        if _tag_matches(tag, p.get("id")) or _tag_matches(tag, p.get("playerId")):
+                            return True, p.get("username")
     except sqlite3.Error as e:
         print(f"[DB-ERROR] {e}")
 
-    return None
+    return False, None
 
-def log_access(action: str,
-               address: str = "",
-               player: str = "Cloud") -> None:
-    """
-    Send an access-log event to ResiLIVE.
 
-    `player` defaults to "Cloud" so every existing call that doesn't
-    care about the owner keeps behaving exactly as before.
-    """
-    url = f"{LOG_URL.rstrip('/')}/log-access"
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Access logging with offline queue
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def log_access(action: str, address: str = "", player: str = "Cloud") -> None:
+    """Send an access-log event to ResiLIVE, queuing on failure."""
     payload = {
         "community": COMMUNITY_NAME,
         "player":    player,
@@ -218,6 +214,13 @@ def log_access(action: str,
     if address:
         payload["address"] = address
 
+    if not _send_log(payload):
+        _enqueue_log(payload)
+
+
+def _send_log(payload: dict) -> bool:
+    """Attempt to POST a log payload. Returns True on success."""
+    url = f"{LOG_URL.rstrip('/')}/log-access"
     try:
         res = requests.post(
             url,
@@ -229,72 +232,259 @@ def log_access(action: str,
             timeout=3,
         )
         if res.status_code >= 400:
-            print(f"[LOG-ERROR] HTTP {res.status_code} – {res.text}")
+            print(f"[LOG-WARN] HTTP {res.status_code} – {res.text}")
+            return False
+        return True
     except requests.RequestException as e:
-        print(f"[LOG-ERROR] {e}")
+        print(f"[LOG-WARN] {e}")
+        return False
+
+
+def _enqueue_log(payload: dict) -> None:
+    """Store a failed log payload in SQLite for later retry."""
+    try:
+        writer_cur.execute(
+            "INSERT INTO pending_logs (payload, created_at) VALUES (?, ?)",
+            (json.dumps(payload), time.time()),
+        )
+        writer_conn.commit()
+    except sqlite3.Error as e:
+        print(f"[QUEUE-ERROR] Failed to enqueue log: {e}")
+
+
+def _flush_pending_logs() -> None:
+    """Background thread: periodically retries pending log entries."""
+    while True:
+        time.sleep(LOG_FLUSH_INTERVAL)
+        try:
+            rows = list(writer_cur.execute(
+                "SELECT id, payload, attempts FROM pending_logs ORDER BY id ASC LIMIT ?",
+                (LOG_FLUSH_BATCH,),
+            ))
+        except sqlite3.Error:
+            continue
+
+        for row_id, payload_str, attempts in rows:
+            try:
+                payload = json.loads(payload_str)
+            except json.JSONDecodeError:
+                _delete_pending_log(row_id)
+                continue
+
+            if _send_log(payload):
+                _delete_pending_log(row_id)
+            else:
+                new_attempts = attempts + 1
+                if new_attempts >= LOG_MAX_ATTEMPTS:
+                    print(f"[QUEUE] Discarding log {row_id} after {new_attempts} attempts")
+                    _delete_pending_log(row_id)
+                else:
+                    try:
+                        writer_cur.execute(
+                            "UPDATE pending_logs SET attempts = ? WHERE id = ?",
+                            (new_attempts, row_id),
+                        )
+                        writer_conn.commit()
+                    except sqlite3.Error:
+                        pass
+
+
+def _delete_pending_log(row_id: int) -> None:
+    try:
+        writer_cur.execute("DELETE FROM pending_logs WHERE id = ?", (row_id,))
+        writer_conn.commit()
+    except sqlite3.Error:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Heartbeat / diagnostics sender
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_system_stats() -> dict:
+    """Collect system stats for the heartbeat payload."""
+    stats = {
+        "community": COMMUNITY_NAME,
+        "hostname": "",
+        "ip": "",
+    }
+
+    # Uptime
+    try:
+        raw_uptime = subprocess.check_output(["uptime", "-p"], text=True).strip()
+        stats["uptime"] = raw_uptime.replace("up ", "")
+    except Exception:
+        stats["uptime"] = "unknown"
+
+    # Hostname
+    try:
+        stats["hostname"] = subprocess.check_output(["hostname"], text=True).strip()
+    except Exception:
+        pass
+
+    # IP address (wlan0)
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "-o", "addr", "show", "wlan0"], text=True
+        ).strip()
+        # Parse "2: wlan0  inet 192.168.1.140/24 ..."
+        parts = out.split()
+        for i, p in enumerate(parts):
+            if p == "inet" and i + 1 < len(parts):
+                stats["ip"] = parts[i + 1].split("/")[0]
+                break
+    except Exception:
+        pass
+
+    # CPU usage (1-second sample)
+    try:
+        with open("/proc/stat") as f:
+            line1 = f.readline()
+        time.sleep(0.2)
+        with open("/proc/stat") as f:
+            line2 = f.readline()
+        v1 = list(map(int, line1.split()[1:]))
+        v2 = list(map(int, line2.split()[1:]))
+        idle1, idle2 = v1[3], v2[3]
+        total1, total2 = sum(v1), sum(v2)
+        delta_total = total2 - total1
+        delta_idle = idle2 - idle1
+        if delta_total > 0:
+            stats["cpu"] = round((1 - delta_idle / delta_total) * 100, 1)
+    except Exception:
+        pass
+
+    # Memory
+    try:
+        with open("/proc/meminfo") as f:
+            meminfo = {}
+            for line in f:
+                parts = line.split()
+                meminfo[parts[0].rstrip(":")] = int(parts[1])
+        total_kb = meminfo.get("MemTotal", 0)
+        avail_kb = meminfo.get("MemAvailable", meminfo.get("MemFree", 0))
+        stats["memTotalMb"] = round(total_kb / 1024)
+        stats["memUsedMb"] = round((total_kb - avail_kb) / 1024)
+    except Exception:
+        pass
+
+    # Disk
+    try:
+        st = os.statvfs("/")
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        used = total - free
+        stats["diskTotalGb"] = round(total / (1024 ** 3), 1)
+        stats["diskUsedGb"] = round(used / (1024 ** 3), 1)
+        stats["diskPct"] = round((used / total) * 100) if total else 0
+    except Exception:
+        pass
+
+    # WiFi signal
+    try:
+        out = subprocess.check_output(["iwconfig", "wlan0"], text=True, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            if "Signal level" in line:
+                # "Signal level=-55 dBm"
+                idx = line.index("Signal level=") + len("Signal level=")
+                val = line[idx:].split()[0].replace("dBm", "")
+                stats["wifiSignalDbm"] = int(val)
+            if "ESSID:" in line:
+                idx = line.index('ESSID:"') + len('ESSID:"')
+                stats["wifiSsid"] = line[idx:].rstrip().rstrip('"')
+    except Exception:
+        pass
+
+    # Firestore connection
+    stats["firestoreConnected"] = _get_snapshot_age() < WATCHDOG_TIMEOUT
+
+    # Serial port
+    stats["serialConnected"] = _serial_connected
+
+    # Pending logs count
+    try:
+        count = writer_cur.execute("SELECT count(*) FROM pending_logs").fetchone()[0]
+        stats["pendingLogs"] = count
+    except Exception:
+        stats["pendingLogs"] = 0
+
+    # Last tag info
+    with _last_tag_lock:
+        stats["lastTag"] = _last_tag_info["tag"]
+        stats["lastTagTime"] = _last_tag_info["time"]
+        stats["lastTagStatus"] = _last_tag_info["status"]
+
+    return stats
+
+
+def _heartbeat_loop() -> None:
+    """Background thread: sends system stats to the ResiLIVE server every HEARTBEAT_INTERVAL."""
+    url = f"{LOG_URL.rstrip('/')}/gateway/heartbeat"
+    while True:
+        try:
+            payload = _get_system_stats()
+            res = requests.post(
+                url,
+                json=payload,
+                headers={
+                    "X-API-Key": API_KEY,
+                    "Content-Type": "application/json",
+                },
+                timeout=5,
+            )
+            if res.status_code >= 400:
+                print(f"[HEARTBEAT-WARN] HTTP {res.status_code} – {res.text[:120]}")
+        except Exception as e:
+            print(f"[HEARTBEAT-WARN] {e}")
+        time.sleep(HEARTBEAT_INTERVAL)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Firestore ↔ SQLite sync
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def upsert(doc_id: str, payload: dict) -> None:
-    """
-    Insert or update a community document in the local SQLite database.
-
-    Args:
-        doc_id (str): The Firestore document ID to insert or update.
-        payload (dict): The document data to store (will be JSON serialized).
-    """
     writer_cur.execute(
         "REPLACE INTO communities (id, data) VALUES (?, ?)",
-        (doc_id, json.dumps(payload, default=str))  # Convert Python dict to JSON string
+        (doc_id, json.dumps(payload, default=str)),
     )
 
-def delete(doc_id: str) -> None:
-    """
-    Remove a community document from the local SQLite database.
 
-    Args:
-        doc_id (str): The Firestore document ID to delete from local cache.
-    """
+def delete(doc_id: str) -> None:
     writer_cur.execute("DELETE FROM communities WHERE id = ?", (doc_id,))
 
+
+def _wal_checkpoint() -> None:
+    """Truncate the WAL file to prevent unbounded growth."""
+    try:
+        writer_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error as e:
+        print(f"[DB-WARN] WAL checkpoint failed: {e}")
+
+
 def initial_sync() -> None:
-    """
-    Perform a one-time sync from Firestore to the local SQLite database.
-
-    This function:
-    1. Fetches all community documents from Firestore
-    2. Stores them in the local SQLite database
-    3. Removes any stale records that no longer exist in Firestore
-
-    This ensures the local database is an accurate mirror of Firestore
-    at startup, enabling fast local access validation even if the
-    network connection is lost later.
-    """
+    """One-time full sync from Firestore to local SQLite."""
     print("🔄  Initial Firestore → SQLite sync…")
-    fs_ids: List[str] = []  # Track Firestore document IDs
+    fs_ids: List[str] = []
 
-    # Fetch all documents from Firestore and store locally
     for doc in communities_ref.stream():
         fs_ids.append(doc.id)
         upsert(doc.id, doc.to_dict())
         print(f"   ↳ synced {doc.id}")
 
-    # Find and remove any documents in SQLite that no longer exist in Firestore
     local_ids = [row[0] for row in writer_cur.execute("SELECT id FROM communities")]
     for stale in set(local_ids) - set(fs_ids):
         delete(stale)
         print(f"   ↳ removed stale {stale}")
 
-    writer_conn.commit()  # Ensure all changes are committed
+    writer_conn.commit()
+    _wal_checkpoint()
     print(f"✅  Sync complete ({len(fs_ids)} docs).")
-    _update_snapshot_time()  # Mark connection as alive
+    _update_snapshot_time()
 
 
 def _resync_firestore() -> bool:
-    """
-    Re-sync data from Firestore after a reconnection.
-
-    Returns:
-        bool: True if sync was successful, False otherwise.
-    """
+    """Re-sync after a reconnection. Returns True on success."""
     try:
         print("🔄  Re-syncing Firestore → SQLite…")
         fs_ids: List[str] = []
@@ -303,12 +493,12 @@ def _resync_firestore() -> bool:
             fs_ids.append(doc.id)
             upsert(doc.id, doc.to_dict())
 
-        # Remove stale records
         local_ids = [row[0] for row in writer_cur.execute("SELECT id FROM communities")]
         for stale in set(local_ids) - set(fs_ids):
             delete(stale)
 
         writer_conn.commit()
+        _wal_checkpoint()
         print(f"✅  Re-sync complete ({len(fs_ids)} docs).")
         _update_snapshot_time()
         return True
@@ -317,48 +507,30 @@ def _resync_firestore() -> bool:
         return False
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Firestore snapshot listener
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def on_snapshot(_, changes, __) -> None:
-    """
-    Firestore snapshot listener callback for real-time updates.
-
-    This function is called automatically whenever changes occur in the
-    Firestore 'communities' collection. It processes document changes
-    (additions, modifications, deletions) and synchronizes them to the
-    local SQLite database.
-
-    Args:
-        _ : Unused Firestore collection snapshot parameter.
-        changes: List of document change events from Firestore.
-        __ : Unused read time parameter.
-    """
-    # Update timestamp to indicate connection is alive
+    """Real-time Firestore listener callback."""
     _update_snapshot_time()
 
     for ch in changes:
         if ch.type.name == "ADDED":
-            # New document added to Firestore - add to local DB
             upsert(ch.document.id, ch.document.to_dict())
             print(f"🟢  ADDED    → {ch.document.id}")
         elif ch.type.name == "MODIFIED":
-            # Existing document modified in Firestore - update local DB
             upsert(ch.document.id, ch.document.to_dict())
             print(f"🟡  MODIFIED → {ch.document.id}")
         elif ch.type.name == "REMOVED":
-            # Document deleted from Firestore - remove from local DB
             delete(ch.document.id)
             print(f"🔴  REMOVED  → {ch.document.id}")
-    writer_conn.commit()  # Commit all changes to ensure data persistence
+    writer_conn.commit()
 
 
 def _check_firestore_connection() -> bool:
-    """
-    Check if Firestore connection is alive by attempting a simple query.
-
-    Returns:
-        bool: True if connection is working, False otherwise.
-    """
+    """Lightweight Firestore connectivity check."""
     try:
-        # Try to fetch just the first document to verify connectivity
         next(communities_ref.limit(1).stream(), None)
         return True
     except Exception as e:
@@ -367,22 +539,15 @@ def _check_firestore_connection() -> bool:
 
 
 def _setup_snapshot_listener():
-    """
-    Set up the Firestore snapshot listener.
-
-    Returns:
-        The watch object for the listener.
-    """
+    """(Re-)establish the Firestore communities snapshot listener."""
     global _current_watch
     with _watch_lock:
-        # Unsubscribe from existing listener if any
         if _current_watch is not None:
             try:
                 _current_watch.unsubscribe()
             except Exception:
-                pass  # Ignore errors when unsubscribing broken listener
+                pass
 
-        # Create new listener
         _current_watch = communities_ref.on_snapshot(on_snapshot)
         _update_snapshot_time()
         return _current_watch
@@ -390,16 +555,15 @@ def _setup_snapshot_listener():
 
 def _firestore_watchdog() -> None:
     """
-    Background thread that monitors Firestore connection and reconnects if needed.
+    Background thread monitoring Firestore connectivity.
 
-    This watchdog:
-    1. Periodically checks if we've received recent snapshot updates
-    2. Attempts to verify Firestore connectivity
-    3. Re-establishes the listener and re-syncs data if connection is broken
-    4. Uses exponential backoff for reconnection attempts
+    Key fix: when the connection check PASSES and there were no prior failures,
+    we simply reset the snapshot timer — the listener is fine, there just
+    haven't been any real changes. We only re-sync + re-establish when
+    recovering from an actual outage.
     """
-    backoff = 5  # Initial backoff time in seconds
     consecutive_failures = 0
+    backoff = 5
 
     print("🔍  Firestore watchdog started")
 
@@ -408,381 +572,82 @@ def _firestore_watchdog() -> None:
 
         snapshot_age = _get_snapshot_age()
 
-        # If we haven't received updates in a while, check connection
-        if snapshot_age > WATCHDOG_TIMEOUT:
-            print(f"⚠️  [WATCHDOG] No Firestore updates in {int(snapshot_age)}s, checking connection…")
-
-            if not _check_firestore_connection():
-                consecutive_failures += 1
-                print(f"❌  [WATCHDOG] Firestore unreachable (attempt {consecutive_failures})")
-
-                # Calculate backoff with exponential increase
-                wait_time = min(backoff * (2 ** (consecutive_failures - 1)), RECONNECT_BACKOFF_MAX)
-                print(f"⏳  [WATCHDOG] Waiting {wait_time}s before retry…")
-                time.sleep(wait_time)
-                continue
-
-            # Connection is back - re-sync and re-establish listener
-            print("🔄  [WATCHDOG] Connection restored, re-establishing listener…")
-
-            if _resync_firestore():
-                _setup_snapshot_listener()
-                _setup_commands_listener()
-                consecutive_failures = 0
-                print("✅  [WATCHDOG] Firestore listener re-established")
-            else:
-                consecutive_failures += 1
-                print("❌  [WATCHDOG] Re-sync failed, will retry")
-        else:
-            # Connection appears healthy
+        if snapshot_age <= WATCHDOG_TIMEOUT:
+            # Connection is healthy
             if consecutive_failures > 0:
                 print("✅  [WATCHDOG] Connection stable")
             consecutive_failures = 0
+            continue
 
+        # Snapshot is stale — check if Firestore is actually reachable
+        print(f"⚠️  [WATCHDOG] No Firestore updates in {int(snapshot_age)}s, checking connection…")
 
-def is_tag_valid(tag: str) -> bool:
-    """
-    Check if a given RFID tag is valid for access to the community.
+        if not _check_firestore_connection():
+            # Firestore is actually unreachable
+            consecutive_failures += 1
+            print(f"❌  [WATCHDOG] Firestore unreachable (attempt {consecutive_failures})")
 
-    This function queries the local SQLite database to validate the tag against:
-    1. The community's allowedUsers list
-    2. People associated with the community's street address
+            # Force restart if stuck too long - systemd will respawn us
+            if consecutive_failures >= WATCHDOG_MAX_FAILURES:
+                print(f"💀  [WATCHDOG] {consecutive_failures} consecutive failures - forcing restart to reset gRPC channel")
+                os._exit(1)
 
-    Args:
-        tag (str): The RFID tag string to validate.
+            wait_time = min(backoff * (2 ** (consecutive_failures - 1)), RECONNECT_BACKOFF_MAX)
+            print(f"⏳  [WATCHDOG] Waiting {wait_time}s before retry…")
+            time.sleep(wait_time)
+            continue
 
-    Returns:
-        bool: True if the tag is valid for access, False otherwise.
-    """
-    # Normalize tag format (strip whitespace and convert to uppercase)
-    tag = tag.strip().upper()
+        # Firestore IS reachable
+        if consecutive_failures == 0:
+            # Connection was never lost — listener is fine, just quiet
+            _update_snapshot_time()
+            continue
 
-    try:
-        # Create a new read-only connection to avoid thread conflicts
-        with sqlite3.connect(SQLITE_PATH, isolation_level=None) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode for better concurrency
+        # Recovering from a real outage — re-sync and re-establish listeners
+        print("🔄  [WATCHDOG] Connection restored, re-establishing listener…")
 
-            # Iterate through all community documents
-            for (data_blob,) in conn.execute("SELECT data FROM communities"):
-                try:
-                    doc = json.loads(data_blob)  # Parse JSON data
-                except json.JSONDecodeError:
-                    continue  # Skip invalid JSON
-
-                # Skip documents for other communities if COMMUNITY_NAME is set
-                if COMMUNITY_NAME and doc.get("name") != COMMUNITY_NAME:
-                    continue
-
-                # Check 1: Is tag in the community's allowedUsers list?
-                for u in doc.get("allowedUsers", []):
-                    if isinstance(u, dict):
-                        if tag == str(u.get("id", "")).upper()[: TAG_LEN - 1] or \
-                           tag == str(u.get("playerId", "")).upper()[: TAG_LEN - 1]:
-                            return True
-                    else:
-                        if tag == str(u).upper()[: TAG_LEN - 1]:
-                            return True
-
-                # Check 2: Is tag associated with a person at the community's street address?
-                for addr in doc.get("addresses", []):
-                    if addr.get("street") != COMMUNITY_STREET_NAME:
-                        continue  # Skip addresses that don't match our street
-
-                    for p in addr.get("people", []):
-                        # Check both id and playerId fields (truncated to TAG_LEN-1)
-                        if tag in {
-                            str(p.get("id", "")).upper()[: TAG_LEN - 1],
-                            str(p.get("playerId", "")).upper()[: TAG_LEN - 1],
-                        }:
-                            return True
-        return False  # Tag not found in any valid entry
-    except sqlite3.Error as e:
-        print(f"[DB-ERROR] {e}")
-        return False  # Return false on database errors
-
-def is_tag_valid_Jones(tag: str) -> bool:
-    """
-    Check if a given RFID tag is valid for access to the community.
-
-    This function queries the local SQLite database to validate the tag against:
-    1. The community's allowedUsers list
-    2. People associated with the community's street address
-
-    Args:
-        tag (str): The RFID tag string to validate.
-
-    Returns:
-        bool: True if the tag is valid for access, False otherwise.
-    """
-    # Normalize tag format (strip whitespace and convert to uppercase)
-    tag = tag.strip().upper()
-
-    try:
-        # Create a new read-only connection to avoid thread conflicts
-        with sqlite3.connect(SQLITE_PATH, isolation_level=None) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode for better concurrency
-
-            # Iterate through all community documents
-            for (data_blob,) in conn.execute("SELECT data FROM communities"):
-                try:
-                    doc = json.loads(data_blob)  # Parse JSON data
-                except json.JSONDecodeError:
-                    continue  # Skip invalid JSON
-
-                # Skip documents for other communities if COMMUNITY_NAME is set
-                if COMMUNITY_NAME and doc.get("name") != COMMUNITY_NAME:
-                    continue
-
-                # Check 1: Is tag in the community's allowedUsers list?
-                for u in doc.get("allowedUsers", []):
-                    if isinstance(u, dict):
-                        if tag == str(u.get("id", "")).upper()[: TAG_LEN - 1] or \
-                           tag == str(u.get("playerId", "")).upper()[: TAG_LEN - 1]:
-                            return True
-                    else:
-                        if tag == str(u).upper()[: TAG_LEN - 1]:
-                            return True
-
-                # Check 2: Is tag associated with a person at the community's street address?
-                for addr in doc.get("addresses", []):
-                    if addr.get("street") != COMMUNITY_STREET_NAME:
-                        continue  # Skip addresses that don't match our street
-
-                    for p in addr.get("people", []):
-                        # Check both id and playerId fields (truncated to TAG_LEN-1)
-                        if tag in {
-                            str(p.get("id", "")).upper()[: TAG_LEN - 1],
-                            str(p.get("playerId", "")).upper()[: TAG_LEN - 1],
-                        }:
-                            return True
-        return False  # Tag not found in any valid entry
-    except sqlite3.Error as e:
-        print(f"[DB-ERROR] {e}")
-        return False  # Return false on database errors
-
-def is_tag_valid_Harvey(tag: str) -> bool:
-    """
-    Check if a given RFID tag is valid for access to the community.
-
-    This function queries the local SQLite database to validate the tag against:
-    1. The community's allowedUsers list
-    2. People associated with the community's street address
-
-    Args:
-        tag (str): The RFID tag string to validate.
-
-    Returns:
-        bool: True if the tag is valid for access, False otherwise.
-    """
-    # Normalize tag format (strip whitespace and convert to uppercase)
-    tag = tag.strip().upper()
-
-    try:
-        # Create a new read-only connection to avoid thread conflicts
-        with sqlite3.connect(SQLITE_PATH, isolation_level=None) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")  # Use WAL mode for better concurrency
-
-            # Iterate through all community documents
-            for (data_blob,) in conn.execute("SELECT data FROM communities"):
-                try:
-                    doc = json.loads(data_blob)  # Parse JSON data
-                except json.JSONDecodeError:
-                    continue  # Skip invalid JSON
-
-                # Skip documents for other communities if COMMUNITY_NAME is set
-                if COMMUNITY_NAME and doc.get("name") != COMMUNITY_NAME:
-                    continue
-
-                # Check 1: Is tag in the community's allowedUsers list?
-                for u in doc.get("allowedUsers", []):
-                    if isinstance(u, dict):
-                        if tag == str(u.get("id", "")).upper()[: TAG_LEN - 1] or \
-                           tag == str(u.get("playerId", "")).upper()[: TAG_LEN - 1]:
-                            return True
-                    else:
-                        if tag == str(u).upper()[: TAG_LEN - 1]:
-                            return True
-
-                # Check 2: Is tag associated with a person at the community's street address?
-                for addr in doc.get("addresses", []):
-                    if addr.get("street") != COMMUNITY_STREET_NAME_HARVEY:
-                        continue  # Skip addresses that don't match our street
-
-                    for p in addr.get("people", []):
-                        # Check both id and playerId fields (truncated to TAG_LEN-1)
-                        if tag in {
-                            str(p.get("id", "")).upper()[: TAG_LEN - 1],
-                            str(p.get("playerId", "")).upper()[: TAG_LEN - 1],
-                        }:
-                            return True
-        return False  # Tag not found in any valid entry
-    except sqlite3.Error as e:
-        print(f"[DB-ERROR] {e}")
-        return False  # Return false on database errors
-
-def read_loop() -> None:
-    """
-    Main loop: continuously reads RFID tags from the serial port and processes them.
-
-    This function:
-    1. Opens a serial connection to the RFID reader
-    2. Continuously reads tag data from the serial port
-    3. Validates each tag against the local database
-    4. Triggers the appropriate relay for access control
-    5. Logs access attempts (granted/denied) to the remote logging service
-    6. Runs until interrupted by a KeyboardInterrupt (Ctrl+C)
-    """
-    # Attempt to open the serial port for the RFID reader
-    print(f"📡  Listening on {SERIAL_PORT} @ {BAUDRATE} bps")
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=SERIAL_TIMEOUT)
-    except serial.SerialException as e:
-        print(f"[SERIAL-ERROR] {e}")
-        return  # Exit if we can't open the serial port
-
-    try:
-        # Main processing loop
-        while True:
-            # Read a line from the serial port and clean it up
-            raw = ser.readline().decode("ascii", errors="ignore").strip()
-
-            # Skip empty lines or lines that don't start with the expected marker
-            if not raw or not raw.startswith("#"):
-                continue
-
-            # Extract the tag portion and convert to uppercase
-            tag_key = raw[1:TAG_LEN].upper()
-            print(f"READ '{tag_key}' – checking… ", end="", flush=True)
-
-            # Validate the tag and process accordingly
-            if is_tag_valid_Harvey(tag_key):
-                # Access granted for Harvey - get owner name if available
-                owner = get_tag_owner_harvey(tag_key) or "Unknown"
-                print("Accepted (Harvey)")
-
-                # Open the Harvey relay
-                try:
-                    open_door("harvey")
-                except Exception as e:
-                    print(f"[RELAY-ERROR] Failed to open Harvey door: {e}")
-
-                # Log the successful access attempt
-                log_access(
-                    f"Access granted via tag: {tag_key}",
-                    COMMUNITY_STREET_NAME_HARVEY or "",
-                    owner
-                )
-
-            elif is_tag_valid_Jones(tag_key):
-                # Access granted for Jones - get owner name if available
-                owner = get_tag_owner(tag_key) or "Unknown"
-                print("Accepted (Jones)")
-
-                # Open the Jones relay
-                try:
-                    open_door("jones")
-                except Exception as e:
-                    print(f"[RELAY-ERROR] Failed to open Jones door: {e}")
-
-                # Log the successful access attempt
-                log_access(
-                    f"Access granted via tag: {tag_key}",
-                    COMMUNITY_STREET_NAME or "",
-                    owner
-                )
-            else:
-                # Access denied - tag not recognized
-                print("Denied")
-
-                # Log the denied access attempt
-                log_access(
-                    f"Access denied, invalid tag: {tag_key}",
-                    COMMUNITY_STREET_NAME or "",
-                    "Unknown"
-                )
-    except KeyboardInterrupt:
-        # Handle clean shutdown on Ctrl+C
-        print("👋  Shutting down")
-    finally:
-        # Ensure serial port is closed even if an exception occurs
-        ser.close()
-
-def perform_grant_access(skip_log: bool = False, address: str = None, duration: float = None) -> None:
-    """
-    Trigger the appropriate relay to grant access based on the address.
-
-    This function:
-    1. Determines which relay to trigger based on the address
-    2. Opens the appropriate door using the relay controller
-    3. Logs the access event to the logging service if skip_log is False
-
-    Args:
-        skip_log (bool): If True, skips logging the access event. Defaults to False.
-        address (str): The address to determine which relay to trigger. If None, defaults to Jones.
-        duration (float): How long to keep the relay open in seconds. If None, uses default (0.5s).
-    """
-    # Determine which relay to trigger
-    if address == COMMUNITY_STREET_NAME_HARVEY:
-        relay_name = "harvey"
-        street = COMMUNITY_STREET_NAME_HARVEY
-    else:
-        relay_name = "jones"
-        street = COMMUNITY_STREET_NAME or ""
-
-    try:
-        # Open the appropriate door (with optional custom duration)
-        if duration:
-            open_door(relay_name, duration=duration)
+        if _resync_firestore():
+            _setup_snapshot_listener()
+            _setup_commands_listener()
+            consecutive_failures = 0
+            print("✅  [WATCHDOG] Firestore listener re-established")
         else:
-            open_door(relay_name)
-        print(f"🚪  Gate opened for {relay_name.capitalize()}")
-    except Exception as e:
-        print(f"[RELAY-ERROR] Failed to open {relay_name} door: {e}")
-
-    # Log the access event if not skipped
-    if not skip_log:
-        log_access("Access granted (Remote)", street)
+            consecutive_failures += 1
+            print("❌  [WATCHDOG] Re-sync failed, will retry")
 
 
-# Track the commands listener
-_commands_watch = None
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Remote commands listener
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_commands_watch      = None
 _commands_watch_lock = threading.Lock()
 
 
 def _on_command_snapshot(doc_snapshot, changes, read_time) -> None:
-    """
-    Firestore snapshot listener callback for remote commands.
-
-    This function is called when commands are added to the 'commands' collection.
-    It processes commands intended for this community and deletes them after execution.
-    """
+    """Firestore listener callback for remote commands."""
     for change in changes:
         if change.type.name != "ADDED":
-            continue  # Only process new commands
+            continue
 
         doc = change.document
         cmd = doc.to_dict()
 
-        # Check if command is for this community
         if cmd.get("community") != COMMUNITY_NAME:
             continue
 
         command_type = cmd.get("command")
         if command_type not in ["open_gate", "pairing_mode"]:
-            # Unknown command - delete it and continue
             try:
                 doc.reference.delete()
             except Exception:
                 pass
             continue
 
-        # Get the requested address from the command
         addr_req = (cmd.get("address") or "").strip()
 
-        # Validate address if specified
         if addr_req:
             if addr_req not in [COMMUNITY_STREET_NAME, COMMUNITY_STREET_NAME_HARVEY]:
-                # Invalid address - delete command and skip
                 try:
                     doc.reference.delete()
                 except Exception:
@@ -792,7 +657,6 @@ def _on_command_snapshot(doc_snapshot, changes, read_time) -> None:
         else:
             target_address = COMMUNITY_STREET_NAME
 
-        # Process the command
         if command_type == "pairing_mode":
             print(f"[PAIRING] Pairing mode request for {target_address or 'default'} - opening for 10 seconds")
             perform_grant_access(skip_log=False, address=target_address, duration=10.0)
@@ -800,7 +664,6 @@ def _on_command_snapshot(doc_snapshot, changes, read_time) -> None:
             print(f"[REMOTE] Remote-controller request for {target_address or 'default'} - opening gate")
             perform_grant_access(skip_log=True, address=target_address)
 
-        # Delete the command after processing
         try:
             doc.reference.delete()
             print(f"[COMMAND] Processed and deleted command: {command_type}")
@@ -809,38 +672,192 @@ def _on_command_snapshot(doc_snapshot, changes, read_time) -> None:
 
 
 def _setup_commands_listener():
-    """
-    Set up the Firestore listener for remote commands.
-
-    Returns:
-        The watch object for the commands listener.
-    """
+    """(Re-)establish the Firestore commands listener."""
     global _commands_watch
     with _commands_watch_lock:
-        # Unsubscribe from existing listener if any
         if _commands_watch is not None:
             try:
                 _commands_watch.unsubscribe()
             except Exception:
                 pass
 
-        # Create listener for commands targeting this community
-        _commands_watch = commands_ref.where("community", "==", COMMUNITY_NAME).on_snapshot(_on_command_snapshot)
+        _commands_watch = commands_ref.where(
+            filter=FieldFilter("community", "==", COMMUNITY_NAME)
+        ).on_snapshot(_on_command_snapshot)
         return _commands_watch
 
-if __name__ == "__main__":
-    # Entry point of the script when run directly
 
-    # Step 1: Perform initial sync from Firestore to local SQLite database
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Relay / access granting
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def perform_grant_access(skip_log: bool = False, address: str = None, duration: float = None) -> None:
+    """Trigger the appropriate relay based on address."""
+    if address == COMMUNITY_STREET_NAME_HARVEY:
+        relay_name = "harvey"
+        street = COMMUNITY_STREET_NAME_HARVEY
+    else:
+        relay_name = "jones"
+        street = COMMUNITY_STREET_NAME or ""
+
+    try:
+        if duration:
+            open_door(relay_name, duration=duration)
+        else:
+            open_door(relay_name)
+        print(f"🚪  Gate opened for {relay_name.capitalize()}")
+    except Exception as e:
+        print(f"[RELAY-ERROR] Failed to open {relay_name} door: {e}")
+
+    if not skip_log:
+        log_access("Access granted (Remote)", street)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Main RFID read loop
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def read_loop() -> None:
+    """
+    Main loop: reads RFID tags, validates, triggers relays, and logs access.
+
+    Includes debounce logic to prevent duplicate tag reads from flooding
+    the system, and filters out reader firmware strings.
+    """
+    global _serial_connected
+    print(f"📡  Listening on {SERIAL_PORT} @ {BAUDRATE} bps")
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=SERIAL_TIMEOUT)
+        _serial_connected = True
+    except serial.SerialException as e:
+        print(f"[SERIAL-ERROR] {e}")
+        _serial_connected = False
+        return
+
+    # Passback / debounce state
+    last_seen: dict[str, float] = {}
+    last_cleanup = time.time()
+
+    try:
+        while True:
+            raw = ser.readline().decode("ascii", errors="ignore").strip()
+
+            if not raw or not raw.startswith("#"):
+                continue
+
+            # ATA tags arrive as "#DFW.05913102 4C...^?$"; 6C tags as
+            # "#31B03E000000030450153F3EF493" with just CRLF. Split on "..."
+            # strips the ATA trailer; for 6C there is no "..." so the body
+            # is the full hex EPC including the PC word.
+            body = raw[1:].split("...", 1)[0].upper()
+            # Filter junk/garbled reads but keep short legitimate tags like
+            # the "JACK" hangtag that emit "#JACK\r\n" (4 chars).
+            if not body or not TAG_PATTERN.match(body):
+                continue
+
+            # 6C tags keep the full EPC as the key (lookup_tag handles the
+            # match via match_6ctoc). ATA tags retain the legacy 12-char
+            # truncation so existing Firestore entries continue to match.
+            if "." not in body and is_6ctoc_tag(body):
+                tag_key = body
+                try:
+                    dec = decode_6ctoc(body)
+                    display = f"{dec.agency_info[0]} {dec.transponder_serial_number:010d}"
+                except Exception:
+                    display = body
+            else:
+                tag_key = body[:TAG_LEN - 1]
+                display = tag_key
+
+            # ── Debounce: skip if same tag seen within PASSBACK_TIMEOUT ──
+            now = time.time()
+            if tag_key in last_seen and (now - last_seen[tag_key]) < PASSBACK_TIMEOUT:
+                continue
+            last_seen[tag_key] = now
+
+            # Periodic cleanup of stale debounce entries
+            if now - last_cleanup > PASSBACK_CLEANUP_INTERVAL:
+                cutoff = now - PASSBACK_TIMEOUT * 2
+                last_seen = {k: v for k, v in last_seen.items() if v > cutoff}
+                last_cleanup = now
+
+            # ── Validate and process ─────────────────────────────────────
+            print(f"READ '{display}' – checking… ", end="", flush=True)
+
+            # Check Harvey first
+            valid, owner = lookup_tag(tag_key, COMMUNITY_STREET_NAME_HARVEY)
+            if valid:
+                owner = owner or "Unknown"
+                print("Accepted (Harvey)")
+                with _last_tag_lock:
+                    _last_tag_info.update(tag=display, time=int(time.time() * 1000), status="granted")
+                try:
+                    open_door("harvey")
+                except Exception as e:
+                    print(f"[RELAY-ERROR] Failed to open Harvey door: {e}")
+                log_access(
+                    f"Access granted via tag: {display}",
+                    COMMUNITY_STREET_NAME_HARVEY or "",
+                    owner,
+                )
+                continue
+
+            # Check Jones
+            valid, owner = lookup_tag(tag_key, COMMUNITY_STREET_NAME)
+            if valid:
+                owner = owner or "Unknown"
+                print("Accepted (Jones)")
+                with _last_tag_lock:
+                    _last_tag_info.update(tag=display, time=int(time.time() * 1000), status="granted")
+                try:
+                    open_door("jones")
+                except Exception as e:
+                    print(f"[RELAY-ERROR] Failed to open Jones door: {e}")
+                log_access(
+                    f"Access granted via tag: {display}",
+                    COMMUNITY_STREET_NAME or "",
+                    owner,
+                )
+                continue
+
+            # Denied
+            print("Denied")
+            with _last_tag_lock:
+                _last_tag_info.update(tag=display, time=int(time.time() * 1000), status="denied")
+            log_access(
+                f"Access denied, invalid tag: {display}",
+                COMMUNITY_STREET_NAME or "",
+                "Unknown",
+            )
+
+    except KeyboardInterrupt:
+        print("👋  Shutting down")
+    finally:
+        ser.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    # 1. Initial Firestore → SQLite sync
     initial_sync()
 
-    # Step 2: Set up real-time listener for Firestore changes (communities)
+    # 2. Real-time Firestore listener (communities)
     _setup_snapshot_listener()
 
-    # Step 3: Start the Firestore watchdog thread for automatic reconnection
+    # 3. Firestore watchdog for auto-reconnect
     threading.Thread(target=_firestore_watchdog, daemon=True).start()
 
-    # Step 4: Set up Firestore listener for remote commands if enabled
+    # 4. Offline log queue flush thread
+    threading.Thread(target=_flush_pending_logs, daemon=True).start()
+
+    # 5. Heartbeat / diagnostics sender
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    print("[HEARTBEAT] Diagnostics heartbeat started")
+
+    # 6. Remote commands listener
     if ENABLE_REMOTE_CONTROL:
         _setup_commands_listener()
         print("[REMOTE] Firestore command listener started")
@@ -848,10 +865,9 @@ if __name__ == "__main__":
         print("[REMOTE] Remote control disabled")
 
     try:
-        # Step 5: Enter the main RFID reading loop (blocks until interrupted)
+        # 6. Main RFID read loop (blocks until Ctrl+C)
         read_loop()
     finally:
-        # Step 6: Clean up resources when exiting
         with _watch_lock:
             if _current_watch is not None:
                 _current_watch.unsubscribe()
