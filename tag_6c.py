@@ -11,6 +11,7 @@ AFI: 0xB0 (Application Family Identifier for tolling)
 """
 
 from dataclasses import dataclass
+import re
 from typing import Optional, Dict, Any, Tuple
 
 
@@ -156,6 +157,13 @@ class ClassifiedTag:
     display_value: str
     protocol: str
     agency_code: Optional[int] = None
+
+
+# Legacy readers append a two-character status/check suffix to the eight
+# characters stored in Firestore (for example, 06838558 + 44).
+LEGACY_STORED_SERIAL_LENGTH = 8
+LEGACY_READER_SERIAL_MAX = 10
+LEGACY_PREFIXED_PATTERN = re.compile(r"^[A-Z]{3,5}[A-Z0-9]{6,10}$")
 
 
 def hex_to_bits(hex_str: str) -> str:
@@ -399,15 +407,21 @@ def match_6ctoc(printed: str, scanned_hex: str) -> bool:
     )
 
 
-def classify_tag_output(body: str, legacy_serial_max: int = 10) -> Optional[ClassifiedTag]:
+def classify_tag_output(body: str) -> Optional[ClassifiedTag]:
     """
     Classify normalized serial-reader output without losing legacy tag support.
 
-    Dotted legacy identifiers are accepted when the serial portion is at most
-    ``legacy_serial_max`` characters. Plain identifiers up to that length are
-    also treated as legacy TransCore output. Longer plain values must decode as
-    6C TOC and resolve to a known, non-reserved agency; everything else is
-    discarded before access lookup or logging.
+    Supported families:
+
+    - Dotted legacy TransCore identifiers. The reader's two-character suffix is
+      removed so the value matches the eight-character serial stored in
+      Firestore.
+    - Short/plain legacy identifiers up to ten characters.
+    - Agency-prefixed legacy identifiers such as ``OOCEA0779782``.
+    - Long 6C TOC output that resolves to a known, non-reserved agency.
+
+    Long output that matches none of these supported families is discarded
+    before access lookup or access-event logging.
     """
     value = body.strip().upper()
     if not value:
@@ -422,15 +436,20 @@ def classify_tag_output(body: str, legacy_serial_max: int = 10) -> Optional[Clas
             and "." not in serial
             and prefix.isalnum()
             and serial.isalnum()
-            and len(serial) <= legacy_serial_max
+            and len(serial) <= LEGACY_READER_SERIAL_MAX
         ):
-            return ClassifiedTag(value, value, "legacy")
+            stored_serial = serial[:LEGACY_STORED_SERIAL_LENGTH]
+            normalized = f"{prefix}.{stored_serial}"
+            return ClassifiedTag(normalized, normalized, "legacy")
         return None
 
-    if len(value) <= legacy_serial_max:
+    if len(value) <= LEGACY_READER_SERIAL_MAX:
         if value.isalnum():
             return ClassifiedTag(value, value, "legacy")
         return None
+
+    if LEGACY_PREFIXED_PATTERN.fullmatch(value):
+        return ClassifiedTag(value, value, "legacy")
 
     try:
         decoded = decode_6ctoc(value)
