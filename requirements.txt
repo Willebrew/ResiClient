@@ -1,3 +1,4 @@
 firebase-admin>=6.0.0
 google-cloud-firestore>=2.0.0
 pyserial>=3.5
+requests>=2.28.0
