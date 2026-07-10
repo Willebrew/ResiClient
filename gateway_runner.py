@@ -34,7 +34,7 @@ import serial
 import requests
 
 from relay_controller import open_door
-from tag_6c import decode_6ctoc, is_6ctoc_tag, match_6ctoc
+from tag_6c import classify_tag_output, match_6ctoc
 from config import (
     COMMUNITY_NAME,
     COMMUNITY_STREET_NAME,
@@ -144,14 +144,15 @@ def _tag_matches(scanned: str, stored) -> bool:
 
     - 6C printed form ("NTTA 0000480314") in storage → match via match_6ctoc()
       against the scanned EPC hex.
-    - ATA tags (no space) → legacy 12-char truncation match.
+    - ATA tags (no space) → exact match, with the old 12-character comparison
+      retained as a compatibility fallback.
     """
     stored = str(stored or "").strip().upper()
     if not stored:
         return False
     if " " in stored:
         return match_6ctoc(stored, scanned)
-    return scanned == stored[:TAG_LEN - 1]
+    return scanned == stored or scanned == stored[:TAG_LEN - 1]
 
 
 def lookup_tag(tag: str, street_name: str) -> Tuple[bool, Optional[str]]:
@@ -740,34 +741,34 @@ def read_loop() -> None:
 
     try:
         while True:
-            raw = ser.readline().decode("ascii", errors="ignore").strip()
+            raw_bytes = ser.readline()
+            raw = raw_bytes.decode("ascii", errors="ignore").strip()
 
             if not raw or not raw.startswith("#"):
                 continue
+
+            # Preserve exact framed bytes in journald for reader diagnostics.
+            print(f"[SERIAL-RAW] hex={raw_bytes.hex().upper()} text={raw!r}")
 
             # ATA tags arrive as "#DFW.05913102 4C...^?$"; 6C tags as
             # "#31B03E000000030450153F3EF493" with just CRLF. Split on "..."
             # strips the ATA trailer; for 6C there is no "..." so the body
             # is the full hex EPC including the PC word.
-            body = raw[1:].split("...", 1)[0].upper()
+            payload = raw[1:].split("...", 1)[0]
+            payload_parts = payload.split()
+            body = payload_parts[0].upper() if payload_parts else ""
             # Filter junk/garbled reads but keep short legitimate tags like
             # the "JACK" hangtag that emit "#JACK\r\n" (4 chars).
             if not body or not TAG_PATTERN.match(body):
                 continue
 
-            # 6C tags keep the full EPC as the key (lookup_tag handles the
-            # match via match_6ctoc). ATA tags retain the legacy 12-char
-            # truncation so existing Firestore entries continue to match.
-            if "." not in body and is_6ctoc_tag(body):
-                tag_key = body
-                try:
-                    dec = decode_6ctoc(body)
-                    display = f"{dec.agency_info[0]} {dec.transponder_serial_number:010d}"
-                except Exception:
-                    display = body
-            else:
-                tag_key = body[:TAG_LEN - 1]
-                display = tag_key
+            classified = classify_tag_output(body)
+            if classified is None:
+                print(f"[TAG-DROP] Unrecognized or unknown-agency output: {body!r}")
+                continue
+
+            tag_key = classified.lookup_value
+            display = classified.display_value
 
             # ── Debounce: skip if same tag seen within PASSBACK_TIMEOUT ──
             now = time.time()

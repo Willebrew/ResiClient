@@ -14,14 +14,16 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
 
 
-# 6C TOC Agency Codes - Updated February 17, 2021
-# Source: http://www.6c-toc.com/sites/default/files/6C Coalition Agency Codes Feb 17 2021.pdf
+# 6C TOC Agency Codes. The NTTA assignments include all three codes in the
+# April 10, 2025 6C Coalition Agency Code Master (41, 53, and 69).
 # Format: agency_code -> (acronym, name, state/region)
 AGENCY_CODES = {
     0: ("Reserved", "Reserved", "N/A"),
     17: ("SC", "Southern Connector", "SC"),
     33: ("NCTA", "North Carolina Toll Authority", "NC"),
     35: ("FTE", "Florida's Turnpike Enterprise", "FL"),
+    41: ("NTTA", "North Texas Tollway Authority", "TX"),
+    53: ("NTTA", "North Texas Tollway Authority", "TX"),
     55: ("OTA", "Oklahoma Turnpike Authority", "OK"),
     61: ("HDBC", "Halifax Dartmouth Bridge Commission", "NS"),
     64: ("FTE", "Florida's Turnpike Enterprise", "FL"),
@@ -66,8 +68,6 @@ AGENCY_CODES = {
     449: ("LSIORB", "Ohio River Bridges (Louisville)", "KY"),
     450: ("LADOTD", "Louisiana Department of Transportation and Development", "LA"),
     451: ("GNOEC", "Greater New Orleans Expressway Commission", "LA"),
-    # 69 derived empirically from scanned NTTA tag (DSFID=0x3E, agency bits 40-51 = 0x045).
-    # Not in the public 6C-TOC Appendix A table but consistent with NIOP assignments.
     69: ("NTTA", "North Texas Tollway Authority", "TX"),
     1409: ("UDOT", "Utah Department of Transportation", "UT"),
     2305: ("TI Corp", "Transportation Investment Corporation", "BC"),
@@ -146,6 +146,16 @@ class Decoded6CTOC:
     check_digit: int
     printed_number: str
     barcode_content: str
+
+
+@dataclass(frozen=True)
+class ClassifiedTag:
+    """Normalized reader output ready for lookup and display."""
+
+    lookup_value: str
+    display_value: str
+    protocol: str
+    agency_code: Optional[int] = None
 
 
 def hex_to_bits(hex_str: str) -> str:
@@ -360,15 +370,6 @@ def encode_6ctoc(printed: str, version: int = 3, include_pc: bool = False) -> st
     return f"31B0{hex_str}" if include_pc else hex_str
 
 
-# Bits the printed form actually encodes:
-#   DSFID    (8)  @ 0-7
-#   Agency   (12) @ 40-51
-#   TSN      (28) @ 52-79
-# Everything else (Agency Use, Classification, HOV, Version, Hash) is
-# unknown from the printed form, so we ignore it during matching.
-_MATCH_MASK = (0xFF << 88) | (0xFFF << 44) | (0x0FFFFFFF << 16)
-
-
 def match_6ctoc(printed: str, scanned_hex: str) -> bool:
     """
     Return True if `printed` (e.g. "NTTA 0000480314") matches the scanned
@@ -378,19 +379,73 @@ def match_6ctoc(printed: str, scanned_hex: str) -> bool:
     and Transponder Serial Number. All other bits (issuer-specific or
     derived) are ignored.
     """
-    s = scanned_hex.strip().lstrip("#").upper()
-    if len(s) == 28:                       # strip optional PC word
-        s = s[4:]
-    if len(s) != 24:
-        return False
-
     try:
-        scanned_int = int(s, 16)
-        encoded_int = int(encode_6ctoc(printed), 16)
+        decoded = decode_6ctoc(scanned_hex)
+        parts = printed.strip().upper().split()
+        if len(parts) < 2:
+            return False
+
+        agency, serial = parts[0], int(parts[1])
+        if agency.isdigit():
+            expected_codes = [int(agency)]
+        else:
+            expected_codes = _ACRONYM_TO_CODES.get(agency, [])
     except (ValueError, KeyError):
         return False
 
-    return (scanned_int & _MATCH_MASK) == (encoded_int & _MATCH_MASK)
+    return (
+        decoded.agency_code in expected_codes
+        and decoded.transponder_serial_number == serial
+    )
+
+
+def classify_tag_output(body: str, legacy_serial_max: int = 10) -> Optional[ClassifiedTag]:
+    """
+    Classify normalized serial-reader output without losing legacy tag support.
+
+    Dotted legacy identifiers are accepted when the serial portion is at most
+    ``legacy_serial_max`` characters. Plain identifiers up to that length are
+    also treated as legacy TransCore output. Longer plain values must decode as
+    6C TOC and resolve to a known, non-reserved agency; everything else is
+    discarded before access lookup or logging.
+    """
+    value = body.strip().upper()
+    if not value:
+        return None
+
+    if "." in value:
+        prefix, separator, serial = value.partition(".")
+        if (
+            separator
+            and prefix
+            and serial
+            and "." not in serial
+            and prefix.isalnum()
+            and serial.isalnum()
+            and len(serial) <= legacy_serial_max
+        ):
+            return ClassifiedTag(value, value, "legacy")
+        return None
+
+    if len(value) <= legacy_serial_max:
+        if value.isalnum():
+            return ClassifiedTag(value, value, "legacy")
+        return None
+
+    try:
+        decoded = decode_6ctoc(value)
+    except ValueError:
+        return None
+
+    if decoded.agency_code not in AGENCY_CODES:
+        return None
+
+    acronym = decoded.agency_info[0].upper()
+    if acronym in {"UNKNOWN", "RESERVED"}:
+        return None
+
+    display = f"{acronym} {decoded.transponder_serial_number:010d}"
+    return ClassifiedTag(value, display, "6c", decoded.agency_code)
 
 
 def is_6ctoc_tag(hex_string: str) -> bool:
@@ -439,4 +494,3 @@ def print_decoded(result: Decoded6CTOC, verbose: bool = True):
         print(f"    Axles:            {result.classification['axles']}")
         print(f"    Weight:           {result.classification['weight']}")
         print(f"    Rear Tires:       {result.classification['rear_tires']}")
-
