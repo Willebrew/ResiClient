@@ -33,7 +33,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 import serial
 import requests
 
-from relay_controller import open_door
+from relay_controller import open_door, warm_up_relay
 from tag_6c import (
     classify_tag_output,
     extract_reader_tag,
@@ -848,6 +848,10 @@ def read_loop() -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # Pre-open the Denkovi USB connection so the first tag is also immediate.
+    if not warm_up_relay():
+        print("[RELAY] Warning: using slower one-shot fallback until reconnect succeeds")
+
     # 1. Initial Firestore → SQLite sync
     initial_sync()
 

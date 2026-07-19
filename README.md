@@ -83,3 +83,20 @@ The gateway listens for commands in the Firestore `commands` collection:
 - Raspberry Pi (tested on Pi 4/5)
 - Denkovi USB relay board (4-channel)
 - RFID reader (serial/USB)
+
+## Low-latency relay controller
+
+The gateway prewarms a persistent Java relay controller at startup. This keeps
+the Denkovi USB connection open and schedules the relay-off timer without
+blocking the RFID loop. The gateway automatically compiles the controller when
+its source changes. To compile it manually:
+
+```bash
+javac \
+  -cp /home/admin/pi-transcore-access-control/lib/denkoviHID-1.6-jar-with-dependencies.jar \
+  relay_daemon/RelayDaemon.java
+```
+
+If the persistent controller cannot start or reconnect, the gateway logs the
+failure and falls back to the original Denkovi command line tool so access is
+not lost.
