@@ -3,6 +3,7 @@ import unittest
 from tag_6c import (
     classify_tag_output,
     encode_6ctoc,
+    extract_reader_tag,
     inspect_6c_candidate,
     match_6ctoc,
 )
@@ -42,7 +43,8 @@ class TagProcessingTests(unittest.TestCase):
                 classified = classify_tag_output(epc)
 
                 self.assertIsNotNone(classified)
-                self.assertEqual(classified.display_value, f"FTE {serial}")
+                self.assertEqual(classified.display_value, "FDTA123456")
+                self.assertEqual(classified.lookup_value, "FDTA123456")
                 self.assertTrue(match_6ctoc(f"FTE {serial}", epc))
 
     def test_values_at_or_below_15_characters_lose_last_two(self):
@@ -51,7 +53,7 @@ class TagProcessingTests(unittest.TestCase):
             "DNT.1268287922": "DNT.12682879",
             "123456789012345": "1234567890123",
             "0058": "00",
-            "JACK": "JA",
+            "JACKZZ": "JACK",
         }
         for raw_value, expected in observed.items():
             with self.subTest(raw_value=raw_value):
@@ -59,6 +61,52 @@ class TagProcessingTests(unittest.TestCase):
                 self.assertIsNotNone(classified)
                 self.assertEqual(classified.lookup_value, expected)
                 self.assertEqual(classified.protocol, "legacy")
+
+    def test_jack_without_reader_suffix_is_preserved(self):
+        classified = classify_tag_output("JACK")
+        self.assertIsNotNone(classified)
+        self.assertEqual(classified.lookup_value, "JACK")
+        self.assertEqual(classified.display_value, "JACK")
+
+    def test_reported_operational_examples_are_preserved(self):
+        for value in ("OOCEA222222", "FDTA22222222", "JACK"):
+            with self.subTest(value=value):
+                classified = classify_tag_output(value)
+                self.assertIsNotNone(classified)
+                self.assertEqual(classified.lookup_value, value)
+
+    def test_production_reader_trailer_variants_are_extracted(self):
+        observed = {
+            "#JACK      \r\n": "JACK",
+            "#DFW.03881851EF...^?$\r\n": "DFW.03881851EF",
+            "#OOCEA0490396588..^I$\r\n": "OOCEA0490396588",
+            "#FDTA1135689583.1.^F$\r\n": "FDTA1135689583",
+            "#35B03E000024030400AD4ADFB487\r\n": "35B03E000024030400AD4ADFB487",
+        }
+        for raw_value, expected in observed.items():
+            with self.subTest(raw_value=raw_value):
+                self.assertEqual(extract_reader_tag(raw_value), expected)
+
+    def test_florida_raw_and_6c_forms_normalize_to_same_fdta_value(self):
+        raw_form = classify_tag_output("FDTA1135689583")
+        six_c_form = classify_tag_output("35B03E000024030400AD4ADFB487")
+        self.assertIsNotNone(raw_form)
+        self.assertIsNotNone(six_c_form)
+        self.assertEqual(raw_form.lookup_value, "FDTA11356895")
+        self.assertEqual(six_c_form.lookup_value, "FDTA11356895")
+
+    def test_cfx_6c_uses_oocea_operational_prefix(self):
+        epc = encode_6ctoc("99 0000222222", include_pc=True)
+        classified = classify_tag_output(epc)
+        self.assertIsNotNone(classified)
+        self.assertEqual(classified.lookup_value, "OOCEA222222")
+
+    def test_hctra_code_42_uses_hc6c_label(self):
+        value = "35B03E9000000402A001A36BDE9E"
+        classified = classify_tag_output(value)
+        self.assertIsNotNone(classified)
+        self.assertEqual(classified.lookup_value, "HC6C 0000107371")
+        self.assertEqual(classified.agency_code, 42)
 
     def test_live_legacy_reader_suffixes_are_removed(self):
         observed = {

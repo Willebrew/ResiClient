@@ -34,7 +34,12 @@ import serial
 import requests
 
 from relay_controller import open_door
-from tag_6c import classify_tag_output, inspect_6c_candidate, match_6ctoc
+from tag_6c import (
+    classify_tag_output,
+    extract_reader_tag,
+    inspect_6c_candidate,
+    match_6ctoc,
+)
 from config import (
     COMMUNITY_NAME,
     COMMUNITY_STREET_NAME,
@@ -150,9 +155,11 @@ def _tag_matches(scanned: str, stored) -> bool:
     stored = str(stored or "").strip().upper()
     if not stored:
         return False
+    if scanned == stored:
+        return True
     if " " in stored:
         return match_6ctoc(stored, scanned)
-    return scanned == stored or scanned[:TAG_LEN - 1] == stored[:TAG_LEN - 1]
+    return scanned[:TAG_LEN - 1] == stored[:TAG_LEN - 1]
 
 
 def lookup_tag(tag: str, street_name: str) -> Tuple[bool, Optional[str]]:
@@ -750,13 +757,9 @@ def read_loop() -> None:
             # Preserve exact framed bytes in journald for reader diagnostics.
             print(f"[SERIAL-RAW] hex={raw_bytes.hex().upper()} text={raw!r}")
 
-            # ATA tags arrive as "#DFW.05913102 4C...^?$"; 6C tags as
-            # "#31B03E000000030450153F3EF493" with just CRLF. Split on "..."
-            # strips the ATA trailer; for 6C there is no "..." so the body
-            # is the full hex EPC including the PC word.
-            payload = raw[1:].split("...", 1)[0]
-            payload_parts = payload.split()
-            body = payload_parts[0].upper() if payload_parts else ""
+            # Reader trailer formats vary by protocol ("...^?$", "..^I$",
+            # and ".1.^F$"). Extract only the leading tag payload.
+            body = extract_reader_tag(raw) or ""
             # Filter junk/garbled reads but keep short legitimate tags like
             # the "JACK" hangtag that emit "#JACK\r\n" (4 chars).
             if not body or not TAG_PATTERN.match(body):

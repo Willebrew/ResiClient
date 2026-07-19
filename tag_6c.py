@@ -11,6 +11,7 @@ AFI: 0xB0 (Application Family Identifier for tolling)
 """
 
 from dataclasses import dataclass
+import re
 from typing import Optional, Dict, Any, Tuple
 
 
@@ -23,6 +24,9 @@ AGENCY_CODES = {
     33: ("NCTA", "North Carolina Toll Authority", "NC"),
     35: ("FTE", "Florida's Turnpike Enterprise", "FL"),
     41: ("NTTA", "North Texas Tollway Authority", "TX"),
+    # Empirical assignment from the production HCTRA 6C scan captured
+    # 2026-07-19. Keep the HC6C label until operator documentation exists.
+    42: ("HC6C", "Harris County Toll Road Authority", "TX"),
     53: ("NTTA", "North Texas Tollway Authority", "TX"),
     55: ("OTA", "Oklahoma Turnpike Authority", "OK"),
     61: ("HDBC", "Halifax Dartmouth Bridge Commission", "NS"),
@@ -159,6 +163,21 @@ class ClassifiedTag:
 
 
 LEGACY_RAW_MAX_LENGTH = 15
+LEGACY_6C_PREFIXES = {
+    "CFX": "OOCEA",
+    "FTE": "FDTA",
+}
+
+
+def extract_reader_tag(raw: str) -> Optional[str]:
+    """Extract the tag payload from known reader framing/trailer variants."""
+    value = raw.strip().upper()
+    if not value.startswith("#"):
+        return None
+
+    payload = value[1:]
+    match = re.match(r"([A-Z]{2,5}\.[A-Z0-9]+|[A-Z0-9]+)", payload)
+    return match.group(1) if match else None
 
 
 def hex_to_bits(hex_str: str) -> str:
@@ -417,6 +436,19 @@ def classify_tag_output(body: str) -> Optional[ClassifiedTag]:
     if not value:
         return None
 
+    # JACK is emitted without the two-character reader suffix used by other
+    # short formats and is itself the canonical stored identifier.
+    if value == "JACK":
+        return ClassifiedTag(value, value, "legacy")
+
+    # These operational forms are already canonical and do not carry the
+    # reader's two-character suffix. Raw reader forms contain ten characters
+    # after the prefix and continue through the suffix-removal path below.
+    if re.fullmatch(r"OOCEA[A-Z0-9]{6,8}", value):
+        return ClassifiedTag(value, value, "legacy")
+    if re.fullmatch(r"FDTA[A-Z0-9]{8}", value):
+        return ClassifiedTag(value, value, "legacy")
+
     if len(value) <= LEGACY_RAW_MAX_LENGTH:
         normalized = value[:-2]
         if not normalized:
@@ -435,8 +467,12 @@ def classify_tag_output(body: str) -> Optional[ClassifiedTag]:
     if acronym in {"UNKNOWN", "RESERVED"}:
         return None
 
-    display = f"{acronym} {decoded.transponder_serial_number:010d}"
-    return ClassifiedTag(value, display, "6c", decoded.agency_code)
+    legacy_prefix = LEGACY_6C_PREFIXES.get(acronym)
+    if legacy_prefix:
+        display = f"{legacy_prefix}{decoded.transponder_serial_number}"
+    else:
+        display = f"{acronym} {decoded.transponder_serial_number:010d}"
+    return ClassifiedTag(display, display, "6c", decoded.agency_code)
 
 
 def inspect_6c_candidate(body: str) -> Dict[str, Any]:
