@@ -11,7 +11,6 @@ AFI: 0xB0 (Application Family Identifier for tolling)
 """
 
 from dataclasses import dataclass
-import re
 from typing import Optional, Dict, Any, Tuple
 
 
@@ -159,11 +158,7 @@ class ClassifiedTag:
     agency_code: Optional[int] = None
 
 
-# Legacy readers append a two-character status/check suffix to the eight
-# characters stored in Firestore (for example, 06838558 + 44).
-LEGACY_STORED_SERIAL_LENGTH = 8
-LEGACY_READER_SERIAL_MAX = 10
-LEGACY_PREFIXED_PATTERN = re.compile(r"^[A-Z]{3,5}[A-Z0-9]{6,10}$")
+LEGACY_RAW_MAX_LENGTH = 15
 
 
 def hex_to_bits(hex_str: str) -> str:
@@ -411,45 +406,22 @@ def classify_tag_output(body: str) -> Optional[ClassifiedTag]:
     """
     Classify normalized serial-reader output without losing legacy tag support.
 
-    Supported families:
+    Reader routing rule:
 
-    - Dotted legacy TransCore identifiers. The reader's two-character suffix is
-      removed so the value matches the eight-character serial stored in
-      Firestore.
-    - Short/plain legacy identifiers up to ten characters.
-    - Agency-prefixed legacy identifiers such as ``OOCEA0779782``.
-    - Long 6C TOC output that resolves to a known, non-reserved agency.
-
-    Long output that matches none of these supported families is discarded
-    before access lookup or access-event logging.
+    - Values of 15 characters or fewer are legacy/raw identifiers. Remove the
+      final two reader status/check characters before lookup.
+    - Values longer than 15 characters are 6C candidates. They must decode as
+      6C TOC and resolve to a known, non-reserved agency before lookup.
     """
     value = body.strip().upper()
     if not value:
         return None
 
-    if "." in value:
-        prefix, separator, serial = value.partition(".")
-        if (
-            separator
-            and prefix
-            and serial
-            and "." not in serial
-            and prefix.isalnum()
-            and serial.isalnum()
-            and len(serial) <= LEGACY_READER_SERIAL_MAX
-        ):
-            stored_serial = serial[:LEGACY_STORED_SERIAL_LENGTH]
-            normalized = f"{prefix}.{stored_serial}"
-            return ClassifiedTag(normalized, normalized, "legacy")
-        return None
-
-    if len(value) <= LEGACY_READER_SERIAL_MAX:
-        if value.isalnum():
-            return ClassifiedTag(value, value, "legacy")
-        return None
-
-    if LEGACY_PREFIXED_PATTERN.fullmatch(value):
-        return ClassifiedTag(value, value, "legacy")
+    if len(value) <= LEGACY_RAW_MAX_LENGTH:
+        normalized = value[:-2]
+        if not normalized:
+            return None
+        return ClassifiedTag(normalized, normalized, "legacy")
 
     try:
         decoded = decode_6ctoc(value)
@@ -465,6 +437,59 @@ def classify_tag_output(body: str) -> Optional[ClassifiedTag]:
 
     display = f"{acronym} {decoded.transponder_serial_number:010d}"
     return ClassifiedTag(value, display, "6c", decoded.agency_code)
+
+
+def inspect_6c_candidate(body: str) -> Dict[str, Any]:
+    """
+    Return diagnostic fields for an undocumented long 6C candidate.
+
+    The raw/PC/UII values are authoritative. Fields prefixed with ``toc`` are
+    interpretations using the public 6C TOC bit layout and may not describe a
+    non-TOC HCTRA encoding. This function intentionally reports those tentative
+    fields even when DSFID is not 0x3E so a new tag can be characterized from
+    production logs without granting access to an unknown agency.
+    """
+    raw = body.strip().lstrip("#").upper()
+    details: Dict[str, Any] = {
+        "raw": raw,
+        "hexLength": len(raw),
+    }
+
+    try:
+        pc_bits, uii = clean_hex_input(raw)
+        int(uii, 16)
+    except ValueError as exc:
+        details["error"] = str(exc)
+        return details
+
+    bits = hex_to_bits(uii)
+    dsfid = extract_bits(bits, 0, 8)
+    agency_code = extract_bits(bits, 40, 12)
+    serial_number = extract_bits(bits, 52, 28)
+    agency_info = AGENCY_CODES.get(
+        agency_code, ("Unknown", f"Agency {agency_code}", "??")
+    )
+
+    details.update({
+        "pc": pc_bits,
+        "pcDecimal": int(pc_bits, 16) if pc_bits else None,
+        "uii": uii,
+        "uiiDecimal": str(int(uii, 16)),
+        "uiiWords16": [uii[i:i + 4] for i in range(0, len(uii), 4)],
+        "dsfidHex": f"0x{dsfid:02X}",
+        "is6cToc": dsfid == 0x3E,
+        "tocAgencyCode": agency_code,
+        "tocAgencyAcronym": agency_info[0],
+        "tocSerialNumber": serial_number,
+        "tocVersion": extract_bits(bits, 36, 4),
+        "tocValidationHashHex": f"0x{extract_bits(bits, 80, 16):04X}",
+    })
+
+    if dsfid == 0x3E:
+        decoded = decode_6ctoc(raw)
+        details["tocPrintedNumber"] = decoded.printed_number
+
+    return details
 
 
 def is_6ctoc_tag(hex_string: str) -> bool:
