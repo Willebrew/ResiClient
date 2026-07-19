@@ -34,7 +34,7 @@ import serial
 import requests
 
 from relay_controller import open_door
-from tag_6c import classify_tag_output, match_6ctoc
+from tag_6c import classify_tag_output, inspect_6c_candidate, match_6ctoc
 from config import (
     COMMUNITY_NAME,
     COMMUNITY_STREET_NAME,
@@ -761,6 +761,9 @@ def read_loop() -> None:
             # the "JACK" hangtag that emit "#JACK\r\n" (4 chars).
             if not body or not TAG_PATTERN.match(body):
                 continue
+
+            if len(body) > 15:
+                print(f"[6C-DETAIL] {json.dumps(inspect_6c_candidate(body), sort_keys=True)}")
 
             classified = classify_tag_output(body)
             if classified is None:

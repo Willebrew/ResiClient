@@ -1,6 +1,11 @@
 import unittest
 
-from tag_6c import classify_tag_output, encode_6ctoc, match_6ctoc
+from tag_6c import (
+    classify_tag_output,
+    encode_6ctoc,
+    inspect_6c_candidate,
+    match_6ctoc,
+)
 
 
 PHOTO_NTTA_SERIALS = (
@@ -40,12 +45,19 @@ class TagProcessingTests(unittest.TestCase):
                 self.assertEqual(classified.display_value, f"FTE {serial}")
                 self.assertTrue(match_6ctoc(f"FTE {serial}", epc))
 
-    def test_legacy_transcore_formats_are_preserved(self):
-        for value in ("DFW.06956066", "DNT.15652347", "0058", "1234567890"):
-            with self.subTest(value=value):
-                classified = classify_tag_output(value)
+    def test_values_at_or_below_15_characters_lose_last_two(self):
+        observed = {
+            "DFW.0683855844": "DFW.06838558",
+            "DNT.1268287922": "DNT.12682879",
+            "123456789012345": "1234567890123",
+            "0058": "00",
+            "JACK": "JA",
+        }
+        for raw_value, expected in observed.items():
+            with self.subTest(raw_value=raw_value):
+                classified = classify_tag_output(raw_value)
                 self.assertIsNotNone(classified)
-                self.assertEqual(classified.lookup_value, value)
+                self.assertEqual(classified.lookup_value, expected)
                 self.assertEqual(classified.protocol, "legacy")
 
     def test_live_legacy_reader_suffixes_are_removed(self):
@@ -64,17 +76,32 @@ class TagProcessingTests(unittest.TestCase):
                 self.assertEqual(classified.display_value, stored_value)
                 self.assertEqual(classified.protocol, "legacy")
 
-    def test_agency_prefixed_legacy_identifier_is_preserved(self):
-        value = "OOCEA0779782"
-        classified = classify_tag_output(value)
-        self.assertIsNotNone(classified)
-        self.assertEqual(classified.lookup_value, value)
-        self.assertEqual(classified.protocol, "legacy")
-
-    def test_long_non_6c_output_is_discarded(self):
-        for value in ("12345678901", "280083348888", "3400301854AA"):
+    def test_values_over_15_characters_must_decode_as_known_6c(self):
+        for value in (
+            "1234567890123456",
+            "280083348888191120441742",
+            "3000DEE0000CF212A4423000709F",
+        ):
             with self.subTest(value=value):
                 self.assertIsNone(classify_tag_output(value))
+
+    def test_undocumented_hctra_candidate_emits_raw_diagnostics(self):
+        value = "3000DEE0000CF212A4423000709F"
+        details = inspect_6c_candidate(value)
+
+        self.assertEqual(details["raw"], value)
+        self.assertEqual(details["hexLength"], 28)
+        self.assertEqual(details["pc"], "3000")
+        self.assertEqual(details["pcDecimal"], 12288)
+        self.assertEqual(details["uii"], "DEE0000CF212A4423000709F")
+        self.assertEqual(
+            details["uiiWords16"],
+            ["DEE0", "000C", "F212", "A442", "3000", "709F"],
+        )
+        self.assertEqual(details["dsfidHex"], "0xDE")
+        self.assertFalse(details["is6cToc"])
+        self.assertIn("tocAgencyCode", details)
+        self.assertIn("tocSerialNumber", details)
 
     def test_unknown_and_reserved_agencies_are_discarded(self):
         unknown = encode_6ctoc("4094 0000000001", include_pc=True)
