@@ -458,6 +458,8 @@ def inspect_6c_candidate(body: str) -> Dict[str, Any]:
     try:
         pc_bits, uii = clean_hex_input(raw)
         int(uii, 16)
+        if pc_bits:
+            int(pc_bits, 16)
     except ValueError as exc:
         details["error"] = str(exc)
         return details
