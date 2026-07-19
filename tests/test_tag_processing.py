@@ -103,6 +103,18 @@ class TagProcessingTests(unittest.TestCase):
         self.assertIn("tocAgencyCode", details)
         self.assertIn("tocSerialNumber", details)
 
+    def test_malformed_pc_word_does_not_raise(self):
+        # UII is valid hex but the PC word contains non-hex characters. This
+        # must be reported as a diagnostic error instead of propagating a
+        # ValueError up into the gateway read loop.
+        value = "ZZZZDEE0000CF212A4423000709F"
+        details = inspect_6c_candidate(value)
+
+        self.assertEqual(details["raw"], value)
+        self.assertEqual(details["hexLength"], 28)
+        self.assertIn("error", details)
+        self.assertNotIn("uii", details)
+
     def test_unknown_and_reserved_agencies_are_discarded(self):
         unknown = encode_6ctoc("4094 0000000001", include_pc=True)
         reserved = encode_6ctoc("0 0000000001", include_pc=True)
