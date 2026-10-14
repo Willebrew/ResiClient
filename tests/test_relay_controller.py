@@ -1,3 +1,4 @@
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -25,6 +26,13 @@ class RelayControllerTests(unittest.TestCase):
                 self.assertTrue(relay_controller.open_door("jones", duration=0.25))
 
         fallback.assert_called_once_with(1, 0.25)
+
+    def test_hung_cli_fallback_times_out_instead_of_blocking(self):
+        hung = subprocess.TimeoutExpired(cmd="java", timeout=relay_controller.CLI_TIMEOUT)
+        with patch.object(relay_controller.subprocess, "run", side_effect=hung) as run:
+            self.assertFalse(relay_controller.control_relay(1, 1))
+
+        self.assertEqual(run.call_args.kwargs["timeout"], relay_controller.CLI_TIMEOUT)
 
     def test_unknown_door_never_sends_a_command(self):
         with patch.object(relay_controller._relay_daemon, "pulse") as pulse:

@@ -37,6 +37,7 @@ DAEMON_CLASS = DAEMON_CLASS_DIR / "RelayDaemon.class"
 RELAY_SERIAL = os.environ.get("DENKOVI_RELAY_SERIAL", "0007252401")
 DAEMON_START_TIMEOUT = 8.0
 DAEMON_COMMAND_TIMEOUT = 3.0
+CLI_TIMEOUT = 10.0
 
 RELAY_MAP = {
     "jones": 1,
@@ -193,10 +194,13 @@ def control_relay(relay_num: int, state: int) -> bool:
     ]
 
     try:
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=CLI_TIMEOUT)
         if result.returncode == 0:
             return True
         print(f"[RELAY] CLI error: {result.stderr.strip()}")
+    except subprocess.TimeoutExpired:
+        # A hung CLI must not block the RFID read loop.
+        print(f"[RELAY] CLI fallback timed out after {CLI_TIMEOUT}s")
     except Exception as exc:
         print(f"[RELAY] Failed to run CLI fallback: {exc}")
     return False

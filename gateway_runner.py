@@ -30,10 +30,10 @@ from typing import List, Optional, Tuple
 import firebase_admin
 from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
-import serial
 import requests
 
 from relay_controller import open_door, warm_up_relay
+from serial_reader import SerialReader
 from tag_6c import (
     classify_tag_output,
     extract_reader_tag,
@@ -734,13 +734,8 @@ def read_loop() -> None:
     """
     global _serial_connected
     print(f"📡  Listening on {SERIAL_PORT} @ {BAUDRATE} bps")
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=SERIAL_TIMEOUT)
-        _serial_connected = True
-    except serial.SerialException as e:
-        print(f"[SERIAL-ERROR] {e}")
-        _serial_connected = False
-        return
+    # Reopens the port if the USB-serial link stalls; see serial_reader.py.
+    reader = SerialReader(SERIAL_PORT, BAUDRATE, SERIAL_TIMEOUT)
 
     # Passback / debounce state
     last_seen: dict[str, float] = {}
@@ -748,7 +743,8 @@ def read_loop() -> None:
 
     try:
         while True:
-            raw_bytes = ser.readline()
+            raw_bytes = reader.readline()
+            _serial_connected = reader.connected
             raw = raw_bytes.decode("ascii", errors="ignore").strip()
 
             if not raw or not raw.startswith("#"):
@@ -840,7 +836,8 @@ def read_loop() -> None:
     except KeyboardInterrupt:
         print("👋  Shutting down")
     finally:
-        ser.close()
+        reader.close()
+        _serial_connected = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
